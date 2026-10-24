@@ -1,0 +1,1 @@
+Fixed CS7065: rebuilt BluetoothBatteryTray.ico as a standard 32-bit BMP-based Windows ICO containing 16, 24, 32, 48, and 64-pixel images. All C# source files unchanged.
