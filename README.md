@@ -1,4 +1,5 @@
-<img width="1672" height="941" alt="Brand" src="https://github.com/user-attachments/assets/041a8627-3d01-4a8d-882e-ea2c07159191" />
+<img width="1672" height="941" alt="Brand" src="https://github.com/user-attachments/assets/e4121da8-6b84-4b38-bbcd-40592c9b7bc2" />
+
                                                              
 A modern battery monitoring experience for Windows 11.
 
