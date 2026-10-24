@@ -12,7 +12,8 @@ namespace BluetoothBatteryTray;
 
 internal sealed class DashboardForm : Form
 {
-    private readonly WebView2 web = new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(9, 13, 23) };
+    private WebView2 web = CreateWebView();
+    private static WebView2 CreateWebView() => new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(9, 13, 23) };
     private readonly Func<(Headset[] connected, string[] known, string selected)> get;
     private readonly Action<string> select;
     private readonly AppPreferences prefs;
@@ -26,6 +27,18 @@ internal sealed class DashboardForm : Form
     private readonly System.Windows.Forms.Timer dismissGuard = new() { Interval = 120 };
     private (Headset[] connected, string[] known, string selected)? queued;
     private readonly System.Windows.Forms.Timer fadeTimer = new() { Interval = 16 };
+    private readonly System.Windows.Forms.Timer healthTimer = new() { Interval = 4000 };
+    private bool healthCheckRunning;
+    private bool recovering;
+    private int failedChecks;
+    private int recoveryAttempts;
+    private DateTime lastRecoveryUtc = DateTime.MinValue;
+    private readonly Label loadingMessage = new()
+    {
+        Text = "Loading battery dashboard…", ForeColor = Color.FromArgb(220, 190, 139),
+        BackColor = Color.FromArgb(9, 13, 23), Dock = DockStyle.Fill,
+        TextAlign = ContentAlignment.MiddleCenter, Visible = false
+    };
 
     public DashboardForm(Func<(Headset[] connected, string[] known, string selected)> get,
         Action<string> select, AppPreferences prefs, BatteryHistory batteryHistory, Action save, Func<bool> getStartup,
@@ -70,18 +83,124 @@ internal sealed class DashboardForm : Form
         };
         VisibleChanged += (_, _) => { if (!Visible) { fadeTimer.Stop(); dismissGuard.Stop(); } };
         Controls.Add(web);
-        web.CoreWebView2InitializationCompleted+=(_,e)=> {
-            if(!e.IsSuccess) { MessageBox.Show("WebView2 could not start: "+e.InitializationException?.Message, "BluetoothBatteryTray"); return; }
-            web.CoreWebView2.Settings.AreDevToolsEnabled=false;
-            web.CoreWebView2.Settings.AreDefaultContextMenusEnabled=false;
-            web.CoreWebView2.Settings.IsStatusBarEnabled=false;
-            web.CoreWebView2.WebMessageReceived+=OnMessage;
-            var f=Path.Combine(AppContext.BaseDirectory,"dashboard.html");
-            web.CoreWebView2.Navigate(new Uri(f).AbsoluteUri);
+        Controls.Add(loadingMessage);
+        loadingMessage.BringToFront();
+        ConfigureWebView(web);
+        healthTimer.Tick += async (_, _) => await CheckWebViewHealthAsync();
+        VisibleChanged += (_, _) =>
+        {
+            if (Visible) { healthTimer.Start(); _ = CheckWebViewHealthAsync(); }
+            else healthTimer.Stop();
         };
-        web.NavigationCompleted+=(_,e)=> { ready=e.IsSuccess; if(ready) { SendPrefs(); var data=queued ?? get(); UpdateDevices(data.connected,data.known,data.selected); } };
         fadeTimer.Tick+=(_,_)=> { Opacity=Math.Min(1,Opacity+0.14); if(Opacity>=1) fadeTimer.Stop(); };
-        Shown+= async (_,_)=> { try { await web.EnsureCoreWebView2Async(); } catch(Exception ex) { MessageBox.Show("WebView2 Runtime is required: "+ex.Message); } };
+        Shown+= async (_,_)=> { await InitializeWebViewAsync(); };
+    }
+    private void ConfigureWebView(WebView2 view)
+    {
+        view.CoreWebView2InitializationCompleted += (_, e) =>
+        {
+            if (!e.IsSuccess)
+            {
+                ShowRecoveryMessage("Dashboard initialization failed. Retrying…");
+                return;
+            }
+            view.CoreWebView2.Settings.AreDevToolsEnabled = false;
+            view.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+            view.CoreWebView2.Settings.IsStatusBarEnabled = false;
+            view.CoreWebView2.WebMessageReceived += OnMessage;
+            view.CoreWebView2.ProcessFailed += (_, _) =>
+            {
+                if (!IsDisposed && !Disposing)
+                    BeginInvoke(new Action(() => _ = RecoverWebViewAsync()));
+            };
+            var htmlPath = Path.Combine(AppContext.BaseDirectory, "dashboard.html");
+            if (!File.Exists(htmlPath))
+            {
+                ShowRecoveryMessage("dashboard.html not found. Keep it beside BluetoothBatteryTray.exe.");
+                return;
+            }
+            view.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri);
+        };
+        view.NavigationCompleted += (_, e) =>
+        {
+            ready = e.IsSuccess;
+            if (ready)
+            {
+                failedChecks = 0;
+                loadingMessage.Visible = false;
+                SendPrefs();
+                var data = queued ?? get();
+                UpdateDevices(data.connected, data.known, data.selected);
+            }
+            else ShowRecoveryMessage("Dashboard could not load. Retrying…");
+        };
+    }
+    private async Task InitializeWebViewAsync()
+    {
+        try { await web.EnsureCoreWebView2Async(); }
+        catch (Exception ex) { ShowRecoveryMessage("WebView2 initialization error: " + ex.Message); }
+    }
+    private void ShowRecoveryMessage(string message)
+    {
+        if (IsDisposed || Disposing) return;
+        loadingMessage.Text = message;
+        loadingMessage.Visible = true;
+        loadingMessage.BringToFront();
+    }
+    private async Task CheckWebViewHealthAsync()
+    {
+        if (!Visible || IsDisposed || healthCheckRunning || recovering) return;
+        healthCheckRunning = true;
+        try
+        {
+            // A blank renderer can still report a successful initial navigation.
+            if (!ready || web.CoreWebView2 == null) { failedChecks++; }
+            else
+            {
+                var probe = web.ExecuteScriptAsync(
+                    "Boolean(document.getElementById('shell') && document.getElementById('devices') && document.getElementById('scroll'))");
+                var completed = await Task.WhenAny(probe, Task.Delay(2500));
+                if (completed != probe) { failedChecks++; }
+                else if ((await probe).Trim().Equals("true", StringComparison.OrdinalIgnoreCase))
+                {
+                    failedChecks = 0;
+                    loadingMessage.Visible = false;
+                }
+                else failedChecks++;
+            }
+            if (failedChecks >= 2) await RecoverWebViewAsync();
+        }
+        catch (Exception) { failedChecks++; if (failedChecks >= 2) await RecoverWebViewAsync(); }
+        finally { healthCheckRunning = false; }
+    }
+    private async Task RecoverWebViewAsync()
+    {
+        if (recovering || IsDisposed || Disposing || !Visible) return;
+        if ((DateTime.UtcNow - lastRecoveryUtc).TotalSeconds < 5) return;
+        recovering = true;
+        lastRecoveryUtc = DateTime.UtcNow;
+        failedChecks = 0;
+        ready = false;
+        ShowRecoveryMessage("Restoring battery dashboard…");
+        try
+        {
+            // Re-create the host, not just reload HTML: this also recovers renderer crashes.
+            var old = web;
+            Controls.Remove(old);
+            old.Dispose();
+            web = CreateWebView();
+            Controls.Add(web);
+            loadingMessage.BringToFront();
+            ConfigureWebView(web);
+            await InitializeWebViewAsync();
+            recoveryAttempts = 0;
+        }
+        catch (Exception ex)
+        {
+            recoveryAttempts++;
+            ShowRecoveryMessage("Dashboard recovery failed: " + ex.Message);
+        }
+        finally { recovering = false; }
     }
     // Clip the native WebView2 HWND to the same rounded outline as the CSS shell.
     // CSS border-radius by itself cannot round the native WinForms host window.
@@ -189,13 +308,13 @@ internal sealed class DashboardForm : Form
     }
     public void ShowAnimated()
     {
-        if(Visible) { Activate(); return; }
+        if(Visible) { Activate(); _ = CheckWebViewHealthAsync(); return; }
         PositionNearCursor(); openedAt=Environment.TickCount64; Opacity=0; Show(); Activate(); fadeTimer.Start(); dismissGuard.Start();
-        SendPrefs(); var d=get(); UpdateDevices(d.connected,d.known,d.selected);
+        SendPrefs(); var d=get(); UpdateDevices(d.connected,d.known,d.selected); _ = CheckWebViewHealthAsync();
     }
     protected override void Dispose(bool disposing)
     {
-        if(disposing) { fadeTimer.Dispose(); dismissGuard.Dispose(); }
+        if(disposing) { fadeTimer.Dispose(); dismissGuard.Dispose(); healthTimer.Dispose(); }
         base.Dispose(disposing);
     }
 }
